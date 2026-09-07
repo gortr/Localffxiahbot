@@ -167,3 +167,17 @@ cython_debug/
 #.idea/
 
 junit.xml
+
+# Local AHBot runtime/configuration
+bin/config.yaml
+*.sqlite
+*.log
+
+# AH economy transient artifacts
+economy/reports/
+economy/generated/*canary*
+economy/generated/*bootstrap*
+economy/generated/*-v1.csv
+
+# Local backups
+*.before-market-stock
