@@ -239,10 +239,27 @@ class Manager(Worker):
                     progress.update(task, advance=0.5)
 
     @property
-    def _sell_time(self) -> int:
-        """Timestamp used by AHBot for synthetic seller listings/history."""
+    def _listing_time(self) -> int:
+        """
+        Future timestamp used for active synthetic listings.
+
+        LandSandBoat expires auction listings based on their listing date.
+        Keeping AHBot listings future-dated prevents synthetic stock from
+        being treated as expired player inventory.
+        """
 
         return timeutils.timestamp(datetime.datetime(2099, 1, 1))
+
+    @property
+    def _history_time(self) -> int:
+        """
+        Current timestamp used for synthetic auction history.
+
+        Unlike active listings, history rows should display a believable
+        real-world date to players.
+        """
+
+        return timeutils.timestamp(datetime.datetime.now())
 
     def _sell_item(
         self,
@@ -265,7 +282,7 @@ class Manager(Worker):
                 itemid=itemid,
                 stack=stack,
                 price=price,
-                date=self._sell_time,
+                date=self._history_time,
                 count=1,
             )
 
@@ -287,7 +304,7 @@ class Manager(Worker):
                 self.seller.sell_item(
                     itemid=itemid,
                     stack=stack,
-                    date=self._sell_time,
+                    date=self._listing_time,
                     price=price,
                     count=1,
                 )
