@@ -262,8 +262,11 @@ class Manager(Worker):
         if history_price is None or history_price <= 0:
             self.seller.set_history(itemid=itemid, stack=stack, price=price, date=self._sell_time, count=1)
 
-        # get stock
-        current_stock = self.browser.get_stock(itemid=itemid, stack=stack, seller=self.seller.seller)
+        # get total active market stock, including player listings
+        current_stock = self.browser.get_stock(itemid=itemid, stack=stack, seller=None)
+
+	# get stock - original
+	#current_stock = self.browser.get_stock(itemid=itemid, stack=stack, seller=self.seller.seller)
 
         # restock
         if current_stock < stock:
