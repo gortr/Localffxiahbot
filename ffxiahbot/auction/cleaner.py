@@ -9,71 +9,104 @@ from ffxiahbot.tables.auctionhouse import AuctionHouse
 class Cleaner(Worker):
     """
     Auction House cleaner.
+
+    Local LSB customization:
+    Clear operations remove only active, unsold listings.
+    Completed auction history is preserved.
     """
+
+    @staticmethod
+    def _active_listing_query(session, seller: int | None = None):
+        """
+        Return a query containing only active, unsold AH listings.
+
+        LandSandBoat / FFXIAHBot completed history rows have a sale value
+        and/or sell_date populated. Those rows must never be removed by
+        ordinary stock-maintenance operations.
+        """
+
+        query = session.query(AuctionHouse).filter(
+            AuctionHouse.sale == 0,
+            AuctionHouse.sell_date == 0,
+        )
+
+        if seller is not None:
+            query = query.filter(
+                AuctionHouse.seller == seller,
+            )
+
+        return query
 
     def clear(self, seller: int | None = None) -> None:
         """
-        Clear out auction house.
+        Clear active auction-house listings while preserving sale history.
 
         Args:
-            seller: The seller to clear out (if None, all rows are cleared).
+            seller:
+                If supplied, clear only active listings belonging to that
+                seller. If None, clear all active listings.
+
+        Important:
+            Completed sale-history rows are intentionally preserved.
         """
-        # clear rows
-        if seller is None:
-            # perform query
-            with self.scoped_session() as session:
-                n = session.query(AuctionHouse).delete()
-                logger.info("%d rows dropped", n)
 
-        # clear rows of seller
-        else:
-            # validate seller
+        if seller is not None:
             with capture(fail=self.fail):
-                if not isinstance(seller, int) or not seller >= 0:
-                    raise RuntimeError("invalid seller: %s", seller)
-
-                # perform query
-                with self.scoped_session() as session:
-                    n = (
-                        session.query(AuctionHouse)
-                        .filter(
-                            AuctionHouse.seller == seller,
-                        )
-                        .delete()
+                if not isinstance(seller, int) or seller < 0:
+                    raise RuntimeError(
+                        "invalid seller: %s",
+                        seller,
                     )
-                    logger.info("%d rows dropped", n)
+
+        with self.scoped_session() as session:
+            query = self._active_listing_query(
+                session,
+                seller=seller,
+            )
+
+            n = query.delete(
+                synchronize_session=False,
+            )
+
+            if seller is None:
+                logger.info(
+                    "%d active auction listings dropped; "
+                    "completed sale history preserved",
+                    n,
+                )
+            else:
+                logger.info(
+                    "%d active auction listings dropped for seller=%d; "
+                    "completed sale history preserved",
+                    n,
+                    seller,
+                )
 
     def count(self, seller: int | None = None) -> int:
         """
-        Count the number of rows that would be dropped.
+        Count active listings that would be dropped by clear().
 
         Args:
-            seller: The seller to count (if None, all rows are counted).
+            seller:
+                If supplied, count only active listings belonging to that
+                seller. If None, count all active listings.
 
         Returns:
-            The number of rows.
+            Number of active, unsold listings that would be removed.
         """
-        # count rows
-        if seller is None:
-            # perform query
-            with self.scoped_session() as session:
-                n = session.query(AuctionHouse).count()
-                return int(n)
 
-        # count rows of seller
-        else:
-            # validate seller
+        if seller is not None:
             with capture(fail=self.fail):
-                if not isinstance(seller, int) or not seller >= 0:
-                    raise RuntimeError("invalid seller: %s", seller)
-
-                # perform query
-                with self.scoped_session() as session:
-                    n = (
-                        session.query(AuctionHouse)
-                        .filter(
-                            AuctionHouse.seller == seller,
-                        )
-                        .count()
+                if not isinstance(seller, int) or seller < 0:
+                    raise RuntimeError(
+                        "invalid seller: %s",
+                        seller,
                     )
-                    return int(n)
+
+        with self.scoped_session() as session:
+            n = self._active_listing_query(
+                session,
+                seller=seller,
+            ).count()
+
+            return int(n)
