@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ GENERATED = ROOT / "economy" / "generated"
 REPORTS = ROOT / "economy" / "reports"
 
 VENDOR_FILE = GENERATED / "vendor-items.csv"
+VENDOR_PRICE_FILE = GENERATED / "vendor-prices.csv"
 MASTER_FILE = GENERATED / "master-market.csv"
 SELLER_FILE = GENERATED / "market-sell-phase0.csv"
 BUYER_FILE = GENERATED / "market-buy-phase0.csv"
@@ -28,12 +30,14 @@ SUMMARY_FILE = REPORTS / "market-build-summary.json"
 
 BUILD_VENDOR = TOOLS / "build_vendor_index.py"
 BUILD_SELLER = TOOLS / "build_phase0.py"
+APPLY_VENDOR_FLOOR = TOOLS / "apply_vendor_price_floor.py"
 BUILD_BUYER = TOOLS / "build_buyer_phase0.py"
 
 
 # Files that must survive a failed build unchanged.
 PRODUCTION_FILES = [
     VENDOR_FILE,
+    VENDOR_PRICE_FILE,
     MASTER_FILE,
     SELLER_FILE,
     BUYER_FILE,
@@ -41,7 +45,16 @@ PRODUCTION_FILES = [
 
 
 # ============================================================
-# Helpers
+# Pricing policy
+# ============================================================
+
+# These MUST match apply_vendor_price_floor.py.
+NPC_SINGLE_CONVENIENCE_MULTIPLIER = 1.10
+NPC_STACK_CONVENIENCE_MULTIPLIER = 1.05
+
+
+# ============================================================
+# Errors / helpers
 # ============================================================
 
 class MarketBuildError(RuntimeError):
@@ -57,6 +70,7 @@ def as_bool_series(series: pd.Series) -> pd.Series:
         1 / 0
         yes / no
         strings produced by pandas CSV round-trips
+        NaN / missing values -> False
     """
 
     return (
@@ -108,11 +122,9 @@ def require_unique_itemids(
             .tolist()
         )
 
-        preview = ids[:20]
-
         raise MarketBuildError(
             f"{label} contains duplicate item IDs: "
-            f"{preview}"
+            f"{ids[:20]}"
         )
 
 
@@ -120,6 +132,11 @@ def run_builder(
     script: Path,
     label: str,
 ) -> None:
+    if not script.exists():
+        raise MarketBuildError(
+            f"{label} script does not exist: {script}"
+        )
+
     print()
     print(
         "======================================"
@@ -153,9 +170,9 @@ def run_builder(
 
 def snapshot_production_files() -> dict[Path, bytes | None]:
     """
-    Save the current production outputs in memory.
+    Save current production outputs in memory.
 
-    None means the file did not exist before this build.
+    None means a file did not exist before this build.
     """
 
     snapshots: dict[
@@ -205,15 +222,17 @@ def load_outputs() -> tuple[
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
+    pd.DataFrame,
 ]:
     for path in [
         MASTER_FILE,
         SELLER_FILE,
         BUYER_FILE,
+        VENDOR_PRICE_FILE,
     ]:
         if not path.exists():
             raise MarketBuildError(
-                f"Expected output was not generated: {path}"
+                f"Expected output does not exist: {path}"
             )
 
     master = pd.read_csv(
@@ -228,10 +247,15 @@ def load_outputs() -> tuple[
         BUYER_FILE
     )
 
+    vendor_prices = pd.read_csv(
+        VENDOR_PRICE_FILE
+    )
+
     return (
         master,
         seller,
         buyer,
+        vendor_prices,
     )
 
 
@@ -243,13 +267,14 @@ def validate_market(
     master: pd.DataFrame,
     seller: pd.DataFrame,
     buyer: pd.DataFrame,
+    vendor_prices: pd.DataFrame,
 ) -> dict:
     """
-    Validate the relationship between the master market,
-    seller catalog, and buyer catalog.
+    Validate relationships between the master market,
+    seller catalog, buyer catalog, and trusted NPC price index.
 
-    Any failure prevents the newly generated production
-    files from replacing the previously working economy.
+    Any failure prevents a newly generated production market
+    from replacing the previously working economy.
     """
 
     master_required = {
@@ -281,6 +306,13 @@ def validate_market(
         "sell_rate_stacks",
     }
 
+    vendor_price_required = {
+        "itemid",
+        "vendor_price_min",
+        "vendor_price_max",
+        "has_hard_floor",
+    }
+
     require_columns(
         master,
         master_required,
@@ -299,6 +331,12 @@ def validate_market(
         "market-buy-phase0.csv",
     )
 
+    require_columns(
+        vendor_prices,
+        vendor_price_required,
+        "vendor-prices.csv",
+    )
+
     require_unique_itemids(
         master,
         "master-market.csv",
@@ -312,6 +350,11 @@ def validate_market(
     require_unique_itemids(
         buyer,
         "market-buy-phase0.csv",
+    )
+
+    require_unique_itemids(
+        vendor_prices,
+        "vendor-prices.csv",
     )
 
     if master.empty:
@@ -332,11 +375,6 @@ def validate_market(
     # --------------------------------------------------------
     # Master approval
     # --------------------------------------------------------
-
-    master_lookup = master.set_index(
-        "itemid",
-        drop=False,
-    )
 
     allowed_mask = as_bool_series(
         master["allowed"]
@@ -368,7 +406,7 @@ def validate_market(
             f"{illegal_seller_ids[:20]}"
         )
 
-    # Buyer v1 must be a subset of seller-approved goods.
+    # Buyer v1 must remain a subset of the Seed seller catalog.
     buyer_outside_seller = sorted(
         buyer_ids - seller_ids
     )
@@ -381,7 +419,7 @@ def validate_market(
         )
 
     # --------------------------------------------------------
-    # Seller direction safety
+    # Seller direction / value safety
     # --------------------------------------------------------
 
     if not (
@@ -433,7 +471,7 @@ def validate_market(
         )
 
     # --------------------------------------------------------
-    # Buyer direction safety
+    # Buyer direction / value safety
     # --------------------------------------------------------
 
     if not (
@@ -485,7 +523,7 @@ def validate_market(
         )
 
     # --------------------------------------------------------
-    # Vendor buyer safety
+    # Buyer vendor safety
     # --------------------------------------------------------
 
     buyer_master = buyer[
@@ -521,7 +559,7 @@ def validate_market(
             f"{unsafe_vendor_buys['itemid'].astype(int).tolist()[:20]}"
         )
 
-    # Seed Buyer v1 intentionally excludes crystals.
+    # Seed Buyer v1 intentionally excludes elemental crystals.
     crystal_buys = buyer_master[
         buyer_master[
             "market_class"
@@ -599,12 +637,10 @@ def validate_market(
     # Rate safety
     # --------------------------------------------------------
 
-    rate_columns = [
+    for column in [
         "buy_rate_single",
         "buy_rate_stacks",
-    ]
-
-    for column in rate_columns:
+    ]:
         rates = buyer[
             column
         ].astype(float)
@@ -619,12 +655,10 @@ def validate_market(
                 "outside 0.0 -> 1.0."
             )
 
-    seller_rate_columns = [
+    for column in [
         "sell_rate_single",
         "sell_rate_stacks",
-    ]
-
-    for column in seller_rate_columns:
+    ]:
         rates = seller[
             column
         ].astype(float)
@@ -638,6 +672,134 @@ def validate_market(
                 f"Seller {column} contains values "
                 "outside 0.0 -> 1.0."
             )
+
+    # --------------------------------------------------------
+    # NPC vendor convenience-price safety
+    # --------------------------------------------------------
+
+    vendor_join = seller.merge(
+        master[
+            [
+                "itemid",
+                "stack_size",
+            ]
+        ],
+        on="itemid",
+        how="left",
+        validate="one_to_one",
+    ).merge(
+        vendor_prices[
+            [
+                "itemid",
+                "vendor_price_min",
+                "vendor_price_max",
+                "has_hard_floor",
+            ]
+        ],
+        on="itemid",
+        how="left",
+        validate="one_to_one",
+    )
+
+    hard_vendor_mask = as_bool_series(
+        vendor_join["has_hard_floor"]
+    )
+
+    trusted_vendor = vendor_join[
+        hard_vendor_mask
+    ].copy()
+
+    vendor_floor_violations: list[dict] = []
+
+    for _, row in trusted_vendor.iterrows():
+        itemid = int(
+            row["itemid"]
+        )
+
+        if pd.isna(
+            row["vendor_price_min"]
+        ):
+            raise MarketBuildError(
+                f"Trusted vendor item {itemid} has "
+                "no vendor_price_min."
+            )
+
+        vendor_price = int(
+            row["vendor_price_min"]
+        )
+
+        if vendor_price <= 0:
+            raise MarketBuildError(
+                f"Trusted vendor item {itemid} has "
+                f"invalid vendor_price_min={vendor_price}."
+            )
+
+        stack_size = int(
+            row["stack_size"]
+        )
+
+        required_single = math.ceil(
+            vendor_price
+            * NPC_SINGLE_CONVENIENCE_MULTIPLIER
+        )
+
+        if (
+            int(row["sell_single"]) == 1
+            and int(row["price_single"])
+            < required_single
+        ):
+            vendor_floor_violations.append(
+                {
+                    "itemid": itemid,
+                    "form": "single",
+                    "ah_price": int(
+                        row["price_single"]
+                    ),
+                    "required_price":
+                        required_single,
+                    "vendor_price":
+                        vendor_price,
+                }
+            )
+
+        if int(
+            row["sell_stacks"]
+        ) == 1:
+            if stack_size <= 1:
+                raise MarketBuildError(
+                    f"Seller item {itemid} has stacks enabled "
+                    f"but stack_size={stack_size}."
+                )
+
+            required_stack = math.ceil(
+                vendor_price
+                * stack_size
+                * NPC_STACK_CONVENIENCE_MULTIPLIER
+            )
+
+            if int(
+                row["price_stacks"]
+            ) < required_stack:
+                vendor_floor_violations.append(
+                    {
+                        "itemid": itemid,
+                        "form": "stack",
+                        "ah_price": int(
+                            row["price_stacks"]
+                        ),
+                        "required_price":
+                            required_stack,
+                        "vendor_price":
+                            vendor_price,
+                    }
+                )
+
+    if vendor_floor_violations:
+        raise MarketBuildError(
+            "AHBot seller undercuts trusted NPC "
+            "convenience-price floor: "
+            f"{vendor_floor_violations[:20]}"
+        )
 
     # --------------------------------------------------------
     # Summary
@@ -684,6 +846,12 @@ def validate_market(
         ),
         "buyer_items": int(
             len(buyer)
+        ),
+        "vendor_price_index_items": int(
+            len(vendor_prices)
+        ),
+        "trusted_vendor_seller_overlaps": int(
+            len(trusted_vendor)
         ),
         "seller_classes": {
             str(k): int(v)
@@ -763,8 +931,9 @@ def main() -> int:
         "--skip-vendor-index",
         action="store_true",
         help=(
-            "Reuse the existing vendor-items.csv instead "
-            "of rescanning the LSB Lua shop scripts."
+            "Reuse existing vendor-items.csv and "
+            "vendor-prices.csv instead of rescanning "
+            "the LSB Lua shop scripts."
         ),
     )
 
@@ -782,7 +951,7 @@ def main() -> int:
             if not args.skip_vendor_index:
                 run_builder(
                     BUILD_VENDOR,
-                    "Building Vendor Index",
+                    "Building Vendor Price Index",
                 )
 
             run_builder(
@@ -790,6 +959,13 @@ def main() -> int:
                 "Building Seed Seller Market",
             )
 
+            run_builder(
+                APPLY_VENDOR_FLOOR,
+                "Applying NPC Vendor Price Floors",
+            )
+
+            # Buyer must be generated AFTER seller prices have
+            # received their NPC convenience-price floors.
             run_builder(
                 BUILD_BUYER,
                 "Building Seed Buyer Market",
@@ -810,12 +986,14 @@ def main() -> int:
             master,
             seller,
             buyer,
+            vendor_prices,
         ) = load_outputs()
 
         summary = validate_market(
             master,
             seller,
             buyer,
+            vendor_prices,
         )
 
         SUMMARY_FILE.write_text(
@@ -835,23 +1013,33 @@ def main() -> int:
         print()
 
         print(
-            f"Master items:          "
+            f"Master items:                  "
             f"{summary['master_items']}"
         )
 
         print(
-            f"Master approved:       "
+            f"Master approved:               "
             f"{summary['master_allowed_items']}"
         )
 
         print(
-            f"Seller catalog:        "
+            f"Seller catalog:                "
             f"{summary['seller_items']}"
         )
 
         print(
-            f"Buyer catalog:         "
+            f"Buyer catalog:                 "
             f"{summary['buyer_items']}"
+        )
+
+        print(
+            f"Vendor price index:            "
+            f"{summary['vendor_price_index_items']}"
+        )
+
+        print(
+            f"Trusted vendor seller overlap: "
+            f"{summary['trusted_vendor_seller_overlaps']}"
         )
 
         print()
@@ -913,10 +1101,16 @@ def main() -> int:
                 snapshots
             )
 
-        print()
-        print(
-            "Previous production market preserved."
-        )
+            print()
+            print(
+                "Previous production market restored."
+            )
+        else:
+            print()
+            print(
+                "Validation only: production files "
+                "were not modified."
+            )
 
         return 1
 
