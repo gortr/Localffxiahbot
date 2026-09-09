@@ -1,920 +1,349 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import math
+import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 
-import pandas as pd
-
-
-# ============================================================
-# Paths
-# ============================================================
 
 ROOT = Path.home() / "ffxiahbot"
-
 TOOLS = ROOT / "economy" / "tools"
 GENERATED = ROOT / "economy" / "generated"
 REPORTS = ROOT / "economy" / "reports"
+BASELINES = ROOT / "economy" / "baselines"
 
-VENDOR_FILE = GENERATED / "vendor-items.csv"
-VENDOR_PRICE_FILE = GENERATED / "vendor-prices.csv"
-MASTER_FILE = GENERATED / "master-market.csv"
-SELLER_FILE = GENERATED / "market-sell-phase0.csv"
-BUYER_FILE = GENERATED / "market-buy-phase0.csv"
+LEGACY_BUILDER = TOOLS / "build_market_legacy.py"
 
-SUMMARY_FILE = REPORTS / "market-build-summary.json"
+SELL_PHASE0 = GENERATED / "market-sell-phase0.csv"
+BUY_PHASE0 = GENERATED / "market-buy-phase0.csv"
 
-BUILD_VENDOR = TOOLS / "build_vendor_index.py"
-BUILD_SELLER = TOOLS / "build_phase0.py"
-APPLY_VENDOR_FLOOR = TOOLS / "apply_vendor_price_floor.py"
-BUILD_BUYER = TOOLS / "build_buyer_phase0.py"
+SELL_CUTOVER = GENERATED / "market-sell-unified-cutover.csv"
+BUY_CUTOVER = GENERATED / "market-buy-unified-cutover.csv"
 
+SELL_RUNTIME = GENERATED / "market-sell.csv"
+BUY_RUNTIME = GENERATED / "market-buy.csv"
 
-# Files that must survive a failed build unchanged.
-PRODUCTION_FILES = [
-    VENDOR_FILE,
-    VENDOR_PRICE_FILE,
-    MASTER_FILE,
-    SELLER_FILE,
-    BUYER_FILE,
-]
+CUTOVER_SUMMARY = REPORTS / "unified-builder-cutover-summary.json"
+
+FROZEN_SELL = BASELINES / "market-sell-seed-v1.csv"
+FROZEN_BUY = BASELINES / "market-buy-seed-v1.csv"
+FROZEN_MANIFEST = BASELINES / "seed-v1-manifest.json"
+
+EXPECTED_SELL = 167
+EXPECTED_BUY = 159
 
 
-# ============================================================
-# Pricing policy
-# ============================================================
-
-# These MUST match apply_vendor_price_floor.py.
-NPC_SINGLE_CONVENIENCE_MULTIPLIER = 1.10
-NPC_STACK_CONVENIENCE_MULTIPLIER = 1.05
-
-
-# ============================================================
-# Errors / helpers
-# ============================================================
-
-class MarketBuildError(RuntimeError):
+class UnifiedBuildError(RuntimeError):
     pass
 
 
-def as_bool_series(series: pd.Series) -> pd.Series:
-    """
-    Normalize CSV boolean-ish values.
-
-    Handles:
-        True / False
-        1 / 0
-        yes / no
-        strings produced by pandas CSV round-trips
-        NaN / missing values -> False
-    """
-
-    return (
-        series.astype(str)
-        .str.strip()
-        .str.lower()
-        .isin(
-            {
-                "true",
-                "1",
-                "yes",
-                "y",
-            }
-        )
-    )
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def require_columns(
-    frame: pd.DataFrame,
-    columns: set[str],
-    label: str,
-) -> None:
-    missing = sorted(
-        columns - set(frame.columns)
-    )
-
-    if missing:
-        raise MarketBuildError(
-            f"{label} is missing required columns: "
-            + ", ".join(missing)
-        )
-
-
-def require_unique_itemids(
-    frame: pd.DataFrame,
-    label: str,
-) -> None:
-    duplicates = frame[
-        frame["itemid"].duplicated(
-            keep=False
-        )
-    ]
-
-    if not duplicates.empty:
-        ids = sorted(
-            duplicates["itemid"]
-            .astype(int)
-            .unique()
-            .tolist()
-        )
-
-        raise MarketBuildError(
-            f"{label} contains duplicate item IDs: "
-            f"{ids[:20]}"
-        )
-
-
-def run_builder(
-    script: Path,
-    label: str,
-) -> None:
+def run_python(script: Path, args: Sequence[str] = ()) -> None:
     if not script.exists():
-        raise MarketBuildError(
-            f"{label} script does not exist: {script}"
+        raise UnifiedBuildError(
+            f"Required tool does not exist: {script}"
         )
 
-    print()
-    print(
-        "======================================"
-    )
-    print(
-        f" {label}"
-    )
-    print(
-        "======================================"
-    )
+    command = [
+        sys.executable,
+        str(script),
+        *args,
+    ]
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-        ],
+    print()
+    print("=" * 72)
+    print(f"RUN: {' '.join(command)}")
+    print("=" * 72)
+
+    subprocess.run(
+        command,
         cwd=ROOT,
-        check=False,
+        check=True,
     )
 
-    if result.returncode != 0:
-        raise MarketBuildError(
-            f"{label} failed with exit code "
-            f"{result.returncode}"
+
+def atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp:
+        temp_path = Path(temp.name)
+
+    try:
+        shutil.copy2(
+            source,
+            temp_path,
+        )
+        temp_path.replace(
+            destination
+        )
+    except Exception:
+        temp_path.unlink(
+            missing_ok=True
+        )
+        raise
+
+
+def csv_row_count(path: Path) -> int:
+    with path.open(
+        "r",
+        encoding="utf-8",
+        errors="replace",
+    ) as handle:
+        lines = sum(
+            1 for _ in handle
         )
 
-
-# ============================================================
-# Backup / rollback
-# ============================================================
-
-def snapshot_production_files() -> dict[Path, bytes | None]:
-    """
-    Save current production outputs in memory.
-
-    None means a file did not exist before this build.
-    """
-
-    snapshots: dict[
-        Path,
-        bytes | None,
-    ] = {}
-
-    for path in PRODUCTION_FILES:
-        if path.exists():
-            snapshots[path] = path.read_bytes()
-        else:
-            snapshots[path] = None
-
-    return snapshots
+    return max(
+        0,
+        lines - 1,
+    )
 
 
-def restore_production_files(
-    snapshots: dict[Path, bytes | None],
-) -> None:
+def freeze_seed_baseline() -> None:
+    BASELINES.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if (
+        FROZEN_SELL.exists()
+        or FROZEN_BUY.exists()
+        or FROZEN_MANIFEST.exists()
+    ):
+        if not (
+            FROZEN_SELL.exists()
+            and FROZEN_BUY.exists()
+            and FROZEN_MANIFEST.exists()
+        ):
+            raise UnifiedBuildError(
+                "Seed-v1 baseline is partially present. "
+                "Refusing to overwrite it."
+            )
+
+        return
+
+    if not SELL_PHASE0.exists():
+        raise UnifiedBuildError(
+            f"Missing seed seller baseline: {SELL_PHASE0}"
+        )
+
+    if not BUY_PHASE0.exists():
+        raise UnifiedBuildError(
+            f"Missing seed buyer baseline: {BUY_PHASE0}"
+        )
+
+    if csv_row_count(
+        SELL_PHASE0
+    ) != EXPECTED_SELL:
+        raise UnifiedBuildError(
+            "Cannot freeze seller baseline: "
+            f"expected {EXPECTED_SELL} rows."
+        )
+
+    if csv_row_count(
+        BUY_PHASE0
+    ) != EXPECTED_BUY:
+        raise UnifiedBuildError(
+            "Cannot freeze buyer baseline: "
+            f"expected {EXPECTED_BUY} rows."
+        )
+
+    atomic_copy(
+        SELL_PHASE0,
+        FROZEN_SELL,
+    )
+
+    atomic_copy(
+        BUY_PHASE0,
+        FROZEN_BUY,
+    )
+
+    manifest = {
+        "baseline": "SEED_V1",
+        "created_utc":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+        "seller_rows":
+            EXPECTED_SELL,
+        "buyer_rows":
+            EXPECTED_BUY,
+        "seller_sha256":
+            sha256(
+                FROZEN_SELL
+            ),
+        "buyer_sha256":
+            sha256(
+                FROZEN_BUY
+            ),
+        "source_seller":
+            str(
+                SELL_PHASE0
+            ),
+        "source_buyer":
+            str(
+                BUY_PHASE0
+            ),
+        "notes": (
+            "Immutable pre-unified-cutover runtime baseline. "
+            "Do not regenerate or overwrite."
+        ),
+    }
+
+    FROZEN_MANIFEST.write_text(
+        json.dumps(
+            manifest,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     print()
-    print(
-        "Restoring previous production files..."
-    )
+    print("Frozen immutable SEED_V1 baseline:")
+    print(f"  {FROZEN_SELL}")
+    print(f"  {FROZEN_BUY}")
+    print(f"  {FROZEN_MANIFEST}")
 
-    for path, contents in snapshots.items():
-        if contents is None:
-            if path.exists():
-                path.unlink()
 
-            continue
-
-        path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
+def validate_cutover_summary() -> dict:
+    if not CUTOVER_SUMMARY.exists():
+        raise UnifiedBuildError(
+            f"Missing cutover summary: {CUTOVER_SUMMARY}"
         )
 
-        path.write_bytes(
-            contents
+    summary = json.loads(
+        CUTOVER_SUMMARY.read_text(
+            encoding="utf-8"
         )
-
-
-# ============================================================
-# Load generated economy
-# ============================================================
-
-def load_outputs() -> tuple[
-    pd.DataFrame,
-    pd.DataFrame,
-    pd.DataFrame,
-    pd.DataFrame,
-]:
-    for path in [
-        MASTER_FILE,
-        SELLER_FILE,
-        BUYER_FILE,
-        VENDOR_PRICE_FILE,
-    ]:
-        if not path.exists():
-            raise MarketBuildError(
-                f"Expected output does not exist: {path}"
-            )
-
-    master = pd.read_csv(
-        MASTER_FILE
     )
 
-    seller = pd.read_csv(
-        SELLER_FILE
-    )
-
-    buyer = pd.read_csv(
-        BUYER_FILE
-    )
-
-    vendor_prices = pd.read_csv(
-        VENDOR_PRICE_FILE
-    )
-
-    return (
-        master,
-        seller,
-        buyer,
-        vendor_prices,
-    )
-
-
-# ============================================================
-# Safety audit
-# ============================================================
-
-def validate_market(
-    master: pd.DataFrame,
-    seller: pd.DataFrame,
-    buyer: pd.DataFrame,
-    vendor_prices: pd.DataFrame,
-) -> dict:
-    """
-    Validate relationships between the master market,
-    seller catalog, buyer catalog, and trusted NPC price index.
-
-    Any failure prevents a newly generated production market
-    from replacing the previously working economy.
-    """
-
-    master_required = {
-        "itemid",
-        "name",
-        "market_class",
-        "allowed",
-        "vendor_item",
-        "base_sell",
-        "stack_size",
-        "provenance",
-        "rejection_reason",
-    }
-
-    market_required = {
-        "itemid",
-        "name",
-        "sell_single",
-        "buy_single",
-        "price_single",
-        "stock_single",
-        "buy_rate_single",
-        "sell_rate_single",
-        "sell_stacks",
-        "buy_stacks",
-        "price_stacks",
-        "stock_stacks",
-        "buy_rate_stacks",
-        "sell_rate_stacks",
-    }
-
-    vendor_price_required = {
-        "itemid",
-        "vendor_price_min",
-        "vendor_price_max",
-        "has_hard_floor",
-    }
-
-    require_columns(
-        master,
-        master_required,
-        "master-market.csv",
-    )
-
-    require_columns(
-        seller,
-        market_required,
-        "market-sell-phase0.csv",
-    )
-
-    require_columns(
-        buyer,
-        market_required,
-        "market-buy-phase0.csv",
-    )
-
-    require_columns(
-        vendor_prices,
-        vendor_price_required,
-        "vendor-prices.csv",
-    )
-
-    require_unique_itemids(
-        master,
-        "master-market.csv",
-    )
-
-    require_unique_itemids(
-        seller,
-        "market-sell-phase0.csv",
-    )
-
-    require_unique_itemids(
-        buyer,
-        "market-buy-phase0.csv",
-    )
-
-    require_unique_itemids(
-        vendor_prices,
-        "vendor-prices.csv",
-    )
-
-    if master.empty:
-        raise MarketBuildError(
-            "Master market is empty."
-        )
-
-    if seller.empty:
-        raise MarketBuildError(
-            "Seller catalog is empty."
-        )
-
-    if buyer.empty:
-        raise MarketBuildError(
-            "Buyer catalog is empty."
-        )
-
-    # --------------------------------------------------------
-    # Master approval
-    # --------------------------------------------------------
-
-    allowed_mask = as_bool_series(
-        master["allowed"]
-    )
-
-    allowed_ids = set(
-        master.loc[
-            allowed_mask,
-            "itemid",
-        ].astype(int)
-    )
-
-    seller_ids = set(
-        seller["itemid"].astype(int)
-    )
-
-    buyer_ids = set(
-        buyer["itemid"].astype(int)
-    )
-
-    illegal_seller_ids = sorted(
-        seller_ids - allowed_ids
-    )
-
-    if illegal_seller_ids:
-        raise MarketBuildError(
-            "Seller contains items not approved by "
-            "master market: "
-            f"{illegal_seller_ids[:20]}"
-        )
-
-    # Buyer v1 must remain a subset of the Seed seller catalog.
-    buyer_outside_seller = sorted(
-        buyer_ids - seller_ids
-    )
-
-    if buyer_outside_seller:
-        raise MarketBuildError(
-            "Buyer contains items outside the Seed "
-            "seller catalog: "
-            f"{buyer_outside_seller[:20]}"
-        )
-
-    # --------------------------------------------------------
-    # Seller direction / value safety
-    # --------------------------------------------------------
-
-    if not (
-        seller["buy_single"].astype(int) == 0
-    ).all():
-        raise MarketBuildError(
-            "Seller CSV has buy_single enabled."
-        )
-
-    if not (
-        seller["buy_stacks"].astype(int) == 0
-    ).all():
-        raise MarketBuildError(
-            "Seller CSV has buy_stacks enabled."
-        )
-
-    enabled_single_sellers = (
-        seller["sell_single"].astype(int) == 1
-    )
-
-    enabled_stack_sellers = (
-        seller["sell_stacks"].astype(int) == 1
-    )
-
-    if (
-        seller.loc[
-            enabled_single_sellers,
-            "price_single",
-        ]
-        .astype(int)
-        .le(0)
-        .any()
-    ):
-        raise MarketBuildError(
-            "Seller contains a non-positive single price."
-        )
-
-    if (
-        seller.loc[
-            enabled_stack_sellers,
-            "price_stacks",
-        ]
-        .astype(int)
-        .le(0)
-        .any()
-    ):
-        raise MarketBuildError(
-            "Seller contains a non-positive stack price."
-        )
-
-    # --------------------------------------------------------
-    # Buyer direction / value safety
-    # --------------------------------------------------------
-
-    if not (
-        buyer["sell_single"].astype(int) == 0
-    ).all():
-        raise MarketBuildError(
-            "Buyer CSV has sell_single enabled."
-        )
-
-    if not (
-        buyer["sell_stacks"].astype(int) == 0
-    ).all():
-        raise MarketBuildError(
-            "Buyer CSV has sell_stacks enabled."
-        )
-
-    if not (
-        buyer["buy_single"].astype(int) == 1
-    ).all():
-        raise MarketBuildError(
-            "Buyer CSV contains buy_single disabled."
-        )
-
-    if not (
-        buyer["buy_stacks"].astype(int) == 1
-    ).all():
-        raise MarketBuildError(
-            "Buyer CSV contains buy_stacks disabled."
-        )
-
-    if (
-        buyer["price_single"]
-        .astype(int)
-        .le(0)
-        .any()
-    ):
-        raise MarketBuildError(
-            "Buyer contains a non-positive single bid."
-        )
-
-    if (
-        buyer["price_stacks"]
-        .astype(int)
-        .le(0)
-        .any()
-    ):
-        raise MarketBuildError(
-            "Buyer contains a non-positive stack bid."
-        )
-
-    # --------------------------------------------------------
-    # Buyer vendor safety
-    # --------------------------------------------------------
-
-    buyer_master = buyer[
-        [
-            "itemid",
-            "name",
-        ]
-    ].merge(
-        master[
-            [
-                "itemid",
-                "market_class",
-                "vendor_item",
-            ]
-        ],
-        on="itemid",
-        how="left",
-        validate="one_to_one",
-    )
-
-    vendor_mask = as_bool_series(
-        buyer_master["vendor_item"]
-    )
-
-    unsafe_vendor_buys = buyer_master[
-        vendor_mask
-    ]
-
-    if not unsafe_vendor_buys.empty:
-        raise MarketBuildError(
-            "Buyer contains NPC vendor-associated "
-            "items: "
-            f"{unsafe_vendor_buys['itemid'].astype(int).tolist()[:20]}"
-        )
-
-    # Seed Buyer v1 intentionally excludes elemental crystals.
-    crystal_buys = buyer_master[
-        buyer_master[
-            "market_class"
-        ].astype(str)
-        == "STAPLE_CRYSTAL"
-    ]
-
-    if not crystal_buys.empty:
-        raise MarketBuildError(
-            "Buyer v1 contains STAPLE_CRYSTAL items."
-        )
-
-    # --------------------------------------------------------
-    # Bid / ask safety
-    # --------------------------------------------------------
-
-    prices = buyer[
-        [
-            "itemid",
-            "price_single",
-            "price_stacks",
-        ]
-    ].merge(
-        seller[
-            [
-                "itemid",
-                "price_single",
-                "price_stacks",
-            ]
-        ],
-        on="itemid",
-        suffixes=(
-            "_buyer",
-            "_seller",
-        ),
-        how="left",
-        validate="one_to_one",
-    )
-
-    bad_single_spread = prices[
-        prices[
-            "price_single_buyer"
-        ].astype(int)
-        >=
-        prices[
-            "price_single_seller"
-        ].astype(int)
-    ]
-
-    if not bad_single_spread.empty:
-        raise MarketBuildError(
-            "Buyer single bid >= seller ask for "
-            "item IDs: "
-            f"{bad_single_spread['itemid'].astype(int).tolist()[:20]}"
-        )
-
-    bad_stack_spread = prices[
-        prices[
-            "price_stacks_buyer"
-        ].astype(int)
-        >=
-        prices[
-            "price_stacks_seller"
-        ].astype(int)
-    ]
-
-    if not bad_stack_spread.empty:
-        raise MarketBuildError(
-            "Buyer stack bid >= seller ask for "
-            "item IDs: "
-            f"{bad_stack_spread['itemid'].astype(int).tolist()[:20]}"
-        )
-
-    # --------------------------------------------------------
-    # Rate safety
-    # --------------------------------------------------------
-
-    for column in [
-        "buy_rate_single",
-        "buy_rate_stacks",
-    ]:
-        rates = buyer[
-            column
-        ].astype(float)
-
-        if (
-            (rates < 0.0)
-            |
-            (rates > 1.0)
-        ).any():
-            raise MarketBuildError(
-                f"Buyer {column} contains values "
-                "outside 0.0 -> 1.0."
-            )
-
-    for column in [
-        "sell_rate_single",
-        "sell_rate_stacks",
-    ]:
-        rates = seller[
-            column
-        ].astype(float)
-
-        if (
-            (rates < 0.0)
-            |
-            (rates > 1.0)
-        ).any():
-            raise MarketBuildError(
-                f"Seller {column} contains values "
-                "outside 0.0 -> 1.0."
-            )
-
-    # --------------------------------------------------------
-    # NPC vendor convenience-price safety
-    # --------------------------------------------------------
-
-    vendor_join = seller.merge(
-        master[
-            [
-                "itemid",
-                "stack_size",
-            ]
-        ],
-        on="itemid",
-        how="left",
-        validate="one_to_one",
-    ).merge(
-        vendor_prices[
-            [
-                "itemid",
-                "vendor_price_min",
-                "vendor_price_max",
-                "has_hard_floor",
-            ]
-        ],
-        on="itemid",
-        how="left",
-        validate="one_to_one",
-    )
-
-    hard_vendor_mask = as_bool_series(
-        vendor_join["has_hard_floor"]
-    )
-
-    trusted_vendor = vendor_join[
-        hard_vendor_mask
-    ].copy()
-
-    vendor_floor_violations: list[dict] = []
-
-    for _, row in trusted_vendor.iterrows():
-        itemid = int(
-            row["itemid"]
-        )
-
-        if pd.isna(
-            row["vendor_price_min"]
-        ):
-            raise MarketBuildError(
-                f"Trusted vendor item {itemid} has "
-                "no vendor_price_min."
-            )
-
-        vendor_price = int(
-            row["vendor_price_min"]
-        )
-
-        if vendor_price <= 0:
-            raise MarketBuildError(
-                f"Trusted vendor item {itemid} has "
-                f"invalid vendor_price_min={vendor_price}."
-            )
-
-        stack_size = int(
-            row["stack_size"]
-        )
-
-        required_single = math.ceil(
-            vendor_price
-            * NPC_SINGLE_CONVENIENCE_MULTIPLIER
-        )
-
-        if (
-            int(row["sell_single"]) == 1
-            and int(row["price_single"])
-            < required_single
-        ):
-            vendor_floor_violations.append(
-                {
-                    "itemid": itemid,
-                    "form": "single",
-                    "ah_price": int(
-                        row["price_single"]
-                    ),
-                    "required_price":
-                        required_single,
-                    "vendor_price":
-                        vendor_price,
-                }
-            )
-
-        if int(
-            row["sell_stacks"]
-        ) == 1:
-            if stack_size <= 1:
-                raise MarketBuildError(
-                    f"Seller item {itemid} has stacks enabled "
-                    f"but stack_size={stack_size}."
-                )
-
-            required_stack = math.ceil(
-                vendor_price
-                * stack_size
-                * NPC_STACK_CONVENIENCE_MULTIPLIER
-            )
-
-            if int(
-                row["price_stacks"]
-            ) < required_stack:
-                vendor_floor_violations.append(
-                    {
-                        "itemid": itemid,
-                        "form": "stack",
-                        "ah_price": int(
-                            row["price_stacks"]
-                        ),
-                        "required_price":
-                            required_stack,
-                        "vendor_price":
-                            vendor_price,
-                    }
-                )
-
-    if vendor_floor_violations:
-        raise MarketBuildError(
-            "AHBot seller undercuts trusted NPC "
-            "convenience-price floor: "
-            f"{vendor_floor_violations[:20]}"
-        )
-
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
-
-    seller_classes = (
-        seller[
-            [
-                "itemid",
-            ]
-        ]
-        .merge(
-            master[
-                [
-                    "itemid",
-                    "market_class",
-                ]
-            ],
-            on="itemid",
-            validate="one_to_one",
-        )["market_class"]
-        .value_counts()
-        .to_dict()
-    )
-
-    buyer_classes = (
-        buyer_master[
-            "market_class"
-        ]
-        .value_counts()
-        .to_dict()
-    )
-
-    summary = {
+    required = {
         "status": "PASS",
-        "master_items": int(
-            len(master)
-        ),
-        "master_allowed_items": int(
-            allowed_mask.sum()
-        ),
-        "seller_items": int(
-            len(seller)
-        ),
-        "buyer_items": int(
-            len(buyer)
-        ),
-        "vendor_price_index_items": int(
-            len(vendor_prices)
-        ),
-        "trusted_vendor_seller_overlaps": int(
-            len(trusted_vendor)
-        ),
-        "seller_classes": {
-            str(k): int(v)
-            for k, v in seller_classes.items()
-        },
-        "buyer_classes": {
-            str(k): int(v)
-            for k, v in buyer_classes.items()
-        },
-        "seller_single_price_min": int(
-            seller[
-                "price_single"
-            ].min()
-        ),
-        "seller_single_price_max": int(
-            seller[
-                "price_single"
-            ].max()
-        ),
-        "buyer_single_bid_min": int(
-            buyer[
-                "price_single"
-            ].min()
-        ),
-        "buyer_single_bid_max": int(
-            buyer[
-                "price_single"
-            ].max()
-        ),
-        "seller_stack_price_min": int(
-            seller[
-                "price_stacks"
-            ].min()
-        ),
-        "seller_stack_price_max": int(
-            seller[
-                "price_stacks"
-            ].max()
-        ),
-        "buyer_stack_bid_min": int(
-            buyer[
-                "price_stacks"
-            ].min()
-        ),
-        "buyer_stack_bid_max": int(
-            buyer[
-                "price_stacks"
-            ].max()
-        ),
+        "compiled_seller_rows": EXPECTED_SELL,
+        "compiled_buyer_rows": EXPECTED_BUY,
+        "seller_semantic_match": True,
+        "buyer_semantic_match": True,
+        "hard_audit_errors": 0,
+        "auto_live_promotions": 0,
     }
+
+    failures = []
+
+    for key, expected in required.items():
+        actual = summary.get(
+            key
+        )
+
+        if actual != expected:
+            failures.append(
+                f"{key}: expected {expected!r}, "
+                f"got {actual!r}"
+            )
+
+    if failures:
+        raise UnifiedBuildError(
+            "Unified cutover validation did not pass:\n  "
+            + "\n  ".join(
+                failures
+            )
+        )
 
     return summary
 
 
-# ============================================================
-# Main build
-# ============================================================
+def validate_runtime_outputs() -> None:
+    for path, expected in [
+        (
+            SELL_CUTOVER,
+            EXPECTED_SELL,
+        ),
+        (
+            BUY_CUTOVER,
+            EXPECTED_BUY,
+        ),
+    ]:
+        if not path.exists():
+            raise UnifiedBuildError(
+                f"Missing compiled output: {path}"
+            )
 
-def main() -> int:
+        rows = csv_row_count(
+            path
+        )
+
+        if rows != expected:
+            raise UnifiedBuildError(
+                f"{path.name}: expected {expected} rows, "
+                f"found {rows}"
+            )
+
+
+def publish_runtime_outputs() -> None:
+    validate_runtime_outputs()
+
+    atomic_copy(
+        SELL_CUTOVER,
+        SELL_RUNTIME,
+    )
+
+    atomic_copy(
+        BUY_CUTOVER,
+        BUY_RUNTIME,
+    )
+
+    if csv_row_count(
+        SELL_RUNTIME
+    ) != EXPECTED_SELL:
+        raise UnifiedBuildError(
+            "Published seller runtime row count changed."
+        )
+
+    if csv_row_count(
+        BUY_RUNTIME
+    ) != EXPECTED_BUY:
+        raise UnifiedBuildError(
+            "Published buyer runtime row count changed."
+        )
+
+    print()
+    print("Published unified runtime files:")
+    print(f"  seller: {SELL_RUNTIME}")
+    print(f"  buyer:  {BUY_RUNTIME}")
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build and validate the LandSandBoat "
-            "AHBot economy."
+            "Unified AHBot economy build orchestrator. "
+            "Runs the legacy SEED generator, canonical policy "
+            "layers, cutover validation, and optional atomic "
+            "runtime publication."
         )
     )
 
@@ -922,197 +351,118 @@ def main() -> int:
         "--validate-only",
         action="store_true",
         help=(
-            "Validate existing generated market files "
-            "without rebuilding them."
+            "Run validation/policy stages without publishing "
+            "market-sell.csv and market-buy.csv."
         ),
     )
 
     parser.add_argument(
-        "--skip-vendor-index",
+        "--skip-legacy",
         action="store_true",
         help=(
-            "Reuse existing vendor-items.csv and "
-            "vendor-prices.csv instead of rescanning "
-            "the LSB Lua shop scripts."
+            "Do not rerun build_market_legacy.py. Use only when "
+            "the Phase-0 generated inputs are already current."
         ),
     )
 
-    args = parser.parse_args()
-
-    REPORTS.mkdir(
-        parents=True,
-        exist_ok=True,
+    parser.add_argument(
+        "--no-freeze-baseline",
+        action="store_true",
+        help=(
+            "Do not create economy/baselines/SEED_V1 files. "
+            "Normally leave this off."
+        ),
     )
 
-    snapshots = snapshot_production_files()
+    return parser.parse_args()
 
-    try:
-        if not args.validate_only:
-            if not args.skip_vendor_index:
-                run_builder(
-                    BUILD_VENDOR,
-                    "Building Vendor Price Index",
-                )
 
-            run_builder(
-                BUILD_SELLER,
-                "Building Seed Seller Market",
-            )
+def main() -> int:
+    args = parse_args()
 
-            run_builder(
-                APPLY_VENDOR_FLOOR,
-                "Applying NPC Vendor Price Floors",
-            )
+    if not args.no_freeze_baseline:
+        freeze_seed_baseline()
 
-            # Buyer must be generated AFTER seller prices have
-            # received their NPC convenience-price floors.
-            run_builder(
-                BUILD_BUYER,
-                "Building Seed Buyer Market",
-            )
+    if not args.skip_legacy:
+        legacy_args = (
+            ["--validate-only"]
+            if args.validate_only
+            else []
+        )
 
-        print()
+        run_python(
+            LEGACY_BUILDER,
+            legacy_args,
+        )
+
+    # Stable canonical layers. Audit/research discovery tools are
+    # intentionally not rerun here; these consume the approved generated
+    # policy sidecars produced during 1B.3-1B.5.
+    pipeline = [
+        TOOLS / "build_vendor_policy.py",
+        TOOLS / "build_canonical_market_policy.py",
+        TOOLS / "build_unified_seller_buyer_policy.py",
+        TOOLS / "build_economy_maturity_policy.py",
+        TOOLS / "build_unified_market_cutover.py",
+    ]
+
+    for script in pipeline:
+        run_python(
+            script
+        )
+
+    summary = validate_cutover_summary()
+
+    if not args.validate_only:
+        publish_runtime_outputs()
+
+    print()
+    print("=" * 72)
+    print(" UNIFIED MARKET BUILD COMPLETE")
+    print("=" * 72)
+    print(
+        f"Status:                 "
+        f"{summary['status']}"
+    )
+    print(
+        f"Server maturity:        "
+        f"{summary.get('server_maturity', 'UNKNOWN')}"
+    )
+    print(
+        f"Live sellers:           "
+        f"{summary['compiled_seller_rows']}"
+    )
+    print(
+        f"Live buyers:            "
+        f"{summary['compiled_buyer_rows']}"
+    )
+    print(
+        f"Staged sellers:         "
+        f"{summary.get('staged_sellers', 0)}"
+    )
+    print(
+        f"Staged buyers:          "
+        f"{summary.get('staged_buyers', 0)}"
+    )
+    print(
+        f"Hard audit errors:      "
+        f"{summary['hard_audit_errors']}"
+    )
+    print(
+        f"Auto live promotions:   "
+        f"{summary['auto_live_promotions']}"
+    )
+
+    if args.validate_only:
         print(
-            "======================================"
+            "Runtime publication:    SKIPPED (--validate-only)"
         )
+    else:
         print(
-            " Market Safety Audit"
-        )
-        print(
-            "======================================"
+            "Runtime publication:    PASS"
         )
 
-        (
-            master,
-            seller,
-            buyer,
-            vendor_prices,
-        ) = load_outputs()
-
-        summary = validate_market(
-            master,
-            seller,
-            buyer,
-            vendor_prices,
-        )
-
-        SUMMARY_FILE.write_text(
-            json.dumps(
-                summary,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-
-        print()
-        print(
-            "MARKET BUILD: PASS"
-        )
-        print()
-
-        print(
-            f"Master items:                  "
-            f"{summary['master_items']}"
-        )
-
-        print(
-            f"Master approved:               "
-            f"{summary['master_allowed_items']}"
-        )
-
-        print(
-            f"Seller catalog:                "
-            f"{summary['seller_items']}"
-        )
-
-        print(
-            f"Buyer catalog:                 "
-            f"{summary['buyer_items']}"
-        )
-
-        print(
-            f"Vendor price index:            "
-            f"{summary['vendor_price_index_items']}"
-        )
-
-        print(
-            f"Trusted vendor seller overlap: "
-            f"{summary['trusted_vendor_seller_overlaps']}"
-        )
-
-        print()
-
-        print(
-            "Seller classes:"
-        )
-
-        for key, value in (
-            summary[
-                "seller_classes"
-            ].items()
-        ):
-            print(
-                f"  {key:<20} {value}"
-            )
-
-        print()
-
-        print(
-            "Buyer classes:"
-        )
-
-        for key, value in (
-            summary[
-                "buyer_classes"
-            ].items()
-        ):
-            print(
-                f"  {key:<20} {value}"
-            )
-
-        print()
-
-        print(
-            f"Summary report: {SUMMARY_FILE}"
-        )
-
-        return 0
-
-    except Exception as exc:
-        print()
-        print(
-            "======================================"
-        )
-        print(
-            " MARKET BUILD FAILED"
-        )
-        print(
-            "======================================"
-        )
-        print()
-        print(
-            str(exc)
-        )
-
-        if not args.validate_only:
-            restore_production_files(
-                snapshots
-            )
-
-            print()
-            print(
-                "Previous production market restored."
-            )
-        else:
-            print()
-            print(
-                "Validation only: production files "
-                "were not modified."
-            )
-
-        return 1
+    return 0
 
 
 if __name__ == "__main__":

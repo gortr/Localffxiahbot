@@ -16,6 +16,7 @@ CLASSIFICATION_FILE = GENERATED / "market-classification.csv"
 PROVENANCE_FILE = GENERATED / "item-provenance.csv"
 MOB_SOURCE_FILE = GENERATED / "mob-source-classification.csv"
 VENDOR_PRICE_FILE = GENERATED / "vendor-prices.csv"
+SOURCE_OVERRIDE_FILE = ROOT / "economy" / "overrides" / "source-provenance-overrides.csv"
 
 OUTPUT_FILE = GENERATED / "candidate-market-policy.csv"
 SUMMARY_FILE = REPORTS / "candidate-market-policy-summary.json"
@@ -318,8 +319,18 @@ def classify_candidate(
         )
     )
 
+    source_override_ordinary = (
+        clean_text(
+            row.get(
+                "source_override_class"
+            )
+        )
+        == "ORDINARY_AVAILABLE"
+    )
+
     ordinary_acquisition = (
         has_ordinary_mob
+        or source_override_ordinary
         or has_fishing
         or unrestricted_craft_output
         or trusted_vendor_route
@@ -493,6 +504,7 @@ def main() -> int:
         PROVENANCE_FILE,
         MOB_SOURCE_FILE,
         VENDOR_PRICE_FILE,
+        SOURCE_OVERRIDE_FILE,
     ]:
         if not path.exists():
             raise CandidatePolicyError(
@@ -523,6 +535,44 @@ def main() -> int:
         VENDOR_PRICE_FILE,
         low_memory=False,
     )
+
+    source_overrides = pd.read_csv(
+        SOURCE_OVERRIDE_FILE,
+        low_memory=False,
+    )
+
+    require_columns(
+        source_overrides,
+        {
+            "itemid",
+            "name",
+            "source_class",
+            "source_types",
+            "reason",
+            "evidence",
+            "evidence_sources",
+        },
+        "source-provenance-overrides.csv",
+    )
+
+    require_unique(
+        source_overrides,
+        "source-provenance-overrides.csv",
+    )
+
+    invalid_override_classes = sorted(
+        set(
+            source_overrides["source_class"]
+            .map(clean_text)
+        )
+        - {"ORDINARY_AVAILABLE"}
+    )
+
+    if invalid_override_classes:
+        raise CandidatePolicyError(
+            "Unsupported source override classes: "
+            f"{invalid_override_classes}"
+        )
 
     require_columns(
         master,
@@ -679,6 +729,33 @@ def main() -> int:
                 "vendor_price_min",
             ]
         ],
+        on="itemid",
+        how="left",
+        validate="one_to_one",
+    ).merge(
+        source_overrides[
+            [
+                "itemid",
+                "source_class",
+                "source_types",
+                "reason",
+                "evidence",
+                "evidence_sources",
+            ]
+        ].rename(
+            columns={
+                "source_class":
+                    "source_override_class",
+                "source_types":
+                    "source_override_types",
+                "reason":
+                    "source_override_reason",
+                "evidence":
+                    "source_override_evidence",
+                "evidence_sources":
+                    "source_override_evidence_sources",
+            }
+        ),
         on="itemid",
         how="left",
         validate="one_to_one",
@@ -897,6 +974,37 @@ def main() -> int:
                 "has_vendor_price_floor":
                     int(
                         has_vendor_floor
+                    ),
+
+                "source_override_applied":
+                    int(
+                        clean_text(
+                            row.get(
+                                "source_override_class"
+                            )
+                        )
+                        != ""
+                    ),
+
+                "source_override_class":
+                    clean_text(
+                        row.get(
+                            "source_override_class"
+                        )
+                    ),
+
+                "source_override_types":
+                    clean_text(
+                        row.get(
+                            "source_override_types"
+                        )
+                    ),
+
+                "source_override_reason":
+                    clean_text(
+                        row.get(
+                            "source_override_reason"
+                        )
                     ),
 
                 "mob_source_class":
@@ -1157,6 +1265,13 @@ def main() -> int:
                 ].sum()
             ),
 
+        "source_overrides_applied":
+            int(
+                output[
+                    "source_override_applied"
+                ].sum()
+            ),
+
         "current_seed_seller":
             167,
 
@@ -1198,6 +1313,11 @@ def main() -> int:
     print(
         f"Total items:               "
         f"{summary['total_items']:>6}"
+    )
+
+    print(
+        f"Source overrides applied:  "
+        f"{summary['source_overrides_applied']:>6}"
     )
 
     print(
@@ -1285,3 +1405,4 @@ if __name__ == "__main__":
     raise SystemExit(
         main()
     )
+

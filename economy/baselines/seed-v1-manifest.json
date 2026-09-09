@@ -1,0 +1,11 @@
+{
+  "baseline": "SEED_V1",
+  "buyer_rows": 159,
+  "buyer_sha256": "939f3cb93824755e57299f457d7de970a7868ae439c9f79a2dd7aab1829ab44e",
+  "created_utc": "2026-09-09T17:44:18.025069+00:00",
+  "notes": "Immutable pre-unified-cutover runtime baseline. Do not regenerate or overwrite.",
+  "seller_rows": 167,
+  "seller_sha256": "6f1efed649542550396f6ffdcd248e9d6266c43a1f0a4e3b4e1425899b2362ba",
+  "source_buyer": "/home/rygol/ffxiahbot/economy/generated/market-buy-phase0.csv",
+  "source_seller": "/home/rygol/ffxiahbot/economy/generated/market-sell-phase0.csv"
+}
