@@ -30,7 +30,19 @@ def test_clear_all(populated_fake_db: Database, transactions: tuple[AHR, ...]) -
 
     # ensure database has 0 rows
     with populated_fake_db.scoped_session() as session:
-        assert session.query(AuctionHouse).count() == 0
+        expected = sum(
+            1
+            for t in transactions
+            if (
+                t.sale != 0
+                or t.sell_date not in (None, 0)
+            )
+        )
+
+        assert (
+            session.query(AuctionHouse).count()
+            == expected
+        )
 
 
 def test_clear_for_seller(populated_fake_db: Database, transactions: tuple[AHR, ...]) -> None:
@@ -45,6 +57,52 @@ def test_clear_for_seller(populated_fake_db: Database, transactions: tuple[AHR, 
 
     # ensure database has 2 rows
     with populated_fake_db.scoped_session() as session:
-        assert session.query(AuctionHouse).count() == 2
-        assert session.query(AuctionHouse).filter(AuctionHouse.seller == 1).count() == 0
+        expected = sum(
+            1
+            for t in transactions
+            if (
+                t.sale != 0
+                or t.sell_date not in (None, 0)
+                or t.seller != 1
+            )
+        )
+
+        assert (
+            session.query(AuctionHouse).count()
+            == expected
+        )
+        # Completed sales for seller 1 must remain. Only active
+        # unsold listings belonging to that seller are cleared.
+        assert (
+            session.query(AuctionHouse)
+            .filter(
+                AuctionHouse.seller == 1,
+                AuctionHouse.sale == 0,
+                AuctionHouse.sell_date == 0,
+            )
+            .count()
+            == 0
+        )
+
+        completed_for_seller = sum(
+            1
+            for t in transactions
+            if (
+                t.seller == 1
+                and (
+                    t.sale != 0
+                    or t.sell_date not in (None, 0)
+                )
+            )
+        )
+
+        assert (
+            session.query(AuctionHouse)
+            .filter(
+                AuctionHouse.seller == 1,
+                AuctionHouse.sale != 0,
+            )
+            .count()
+            == completed_for_seller
+        )
         assert session.query(AuctionHouse).filter(AuctionHouse.seller == 2).count() == 2

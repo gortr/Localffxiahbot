@@ -106,6 +106,196 @@ def test_buy_items(
                 ahr.validate_query_result(row, id=i + 1)
 
 
+
+
+def test_buy_rate_sampled_once_per_item_form_per_cycle(
+    populated_fake_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Listing spam must not amplify the configured buyer rate."""
+
+    limited_items = ItemList(
+        items={
+            1: Item(
+                itemid=1,
+                name="Rate Limited Item",
+                sell_single=True,
+                buy_single=True,
+                price_single=100,
+                stock_single=0,
+                buy_rate_single=0.50,
+                sell_rate_single=1.0,
+                sell_stacks=True,
+                buy_stacks=True,
+                price_stacks=1200,
+                stock_stacks=0,
+                buy_rate_stacks=0.50,
+                sell_rate_stacks=1.0,
+            ),
+        }
+    )
+
+    transactions = [
+        *AHR.many(
+            count=10,
+            price=50,
+            seller=1,
+            seller_name="A",
+            itemid=1,
+            stack=0,
+        ),
+        *AHR.many(
+            count=10,
+            price=600,
+            seller=1,
+            seller_name="A",
+            itemid=1,
+            stack=1,
+        ),
+    ]
+
+    setup_ah_transactions(
+        populated_fake_db,
+        *transactions,
+    )
+
+    calls = []
+
+    def reject_rate() -> float:
+        calls.append(1)
+        return 0.99
+
+    monkeypatch.setattr(
+        "ffxiahbot.auction.manager.random.random",
+        reject_rate,
+    )
+
+    manager = Manager.from_db(
+        populated_fake_db,
+        name="X",
+        rollback=True,
+        fail=True,
+    )
+
+    manager.buy_items(
+        limited_items,
+        use_buying_rates=True,
+    )
+
+    # One probability sample for SINGLE and one for STACK,
+    # regardless of the ten listings in each form.
+    assert len(calls) == 2
+
+    with populated_fake_db.scoped_session() as session:
+        rows = (
+            session.query(AuctionHouse)
+            .filter(AuctionHouse.itemid == 1)
+            .all()
+        )
+
+        assert all(row.sale == 0 for row in rows)
+        assert all(row.sell_date == 0 for row in rows)
+
+
+def test_buy_rate_pass_buys_only_one_and_pays_configured_bid(
+    populated_fake_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A passing form-level rate permits one purchase at the bot bid."""
+
+    limited_items = ItemList(
+        items={
+            1: Item(
+                itemid=1,
+                name="Rate Limited Item",
+                sell_single=True,
+                buy_single=True,
+                price_single=100,
+                stock_single=0,
+                buy_rate_single=0.50,
+                sell_rate_single=1.0,
+                sell_stacks=False,
+                buy_stacks=False,
+                price_stacks=0,
+                stock_stacks=0,
+                buy_rate_stacks=0.50,
+                sell_rate_stacks=1.0,
+            ),
+        }
+    )
+
+    transactions = AHR.many(
+        count=10,
+        price=1,
+        seller=1,
+        seller_name="A",
+        itemid=1,
+        stack=0,
+    )
+
+    setup_ah_transactions(
+        populated_fake_db,
+        *transactions,
+    )
+
+    calls = []
+
+    def accept_rate() -> float:
+        calls.append(1)
+        return 0.01
+
+    monkeypatch.setattr(
+        "ffxiahbot.auction.manager.random.random",
+        accept_rate,
+    )
+
+    manager = Manager.from_db(
+        populated_fake_db,
+        name="X",
+        rollback=True,
+        fail=True,
+    )
+
+    manager.buy_items(
+        limited_items,
+        use_buying_rates=True,
+    )
+
+    # Ten listings still produce exactly one probability sample.
+    assert len(calls) == 1
+
+    with populated_fake_db.scoped_session() as session:
+        rows = (
+            session.query(AuctionHouse)
+            .filter(
+                AuctionHouse.itemid == 1,
+                AuctionHouse.stack == 0,
+            )
+            .all()
+        )
+
+        sold = [
+            row
+            for row in rows
+            if row.sell_date != 0
+        ]
+
+        assert len(sold) == 1
+
+        # Player asked 1 gil, but AHBot deliberately pays its
+        # configured bid ceiling of 100 gil.
+        assert sold[0].sale == 100
+        assert sold[0].buyer_name == "X"
+
+        unsold = [
+            row
+            for row in rows
+            if row.sell_date == 0
+        ]
+
+        assert len(unsold) == 9
+
+
 @pytest.mark.parametrize(
     "transactions,expected_history,expected_stock",
     [

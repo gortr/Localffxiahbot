@@ -102,10 +102,18 @@ class Manager(Worker):
 
             counts: Counter[str] = Counter()
 
-            # Custom LSB safety rule:
-            # A single buyer cycle may purchase at most one listing for each
-            # (itemid, stack-state) pair. Singles and stacks are separate keys.
+            # Custom LSB safety rules:
+            #
+            # 1. A single buyer cycle may purchase at most one listing for
+            #    each (itemid, stack-state) pair.
+            #
+            # 2. Buying-rate probability is sampled at most once for each
+            #    (itemid, stack-state) pair per cycle. Multiple listings for
+            #    the same item/form must not amplify the effective buy rate.
+            #
+            # Singles and stacks remain separate keys.
             purchased_this_cycle: set[tuple[int, bool]] = set()
+            rate_allowed_this_cycle: dict[tuple[int, bool], bool] = {}
 
             for row in rows:
                 if row.id in self.blacklist:
@@ -142,9 +150,23 @@ class Manager(Worker):
                             counts["forbidden item"] += 1
                             continue
 
-                        if use_buying_rates and random.random() > item.buy_rate_stacks:
-                            counts["buy rate too low"] += 1
-                            continue
+                        if use_buying_rates:
+                            rate_allowed = rate_allowed_this_cycle.get(
+                                purchase_key
+                            )
+
+                            if rate_allowed is None:
+                                rate_allowed = (
+                                    random.random()
+                                    <= item.buy_rate_stacks
+                                )
+                                rate_allowed_this_cycle[
+                                    purchase_key
+                                ] = rate_allowed
+
+                            if not rate_allowed:
+                                counts["buy rate too low"] += 1
+                                continue
 
                         if self._buy_row(row, item.price_stacks):
                             purchased_this_cycle.add(purchase_key)
@@ -162,9 +184,23 @@ class Manager(Worker):
                             counts["forbidden item"] += 1
                             continue
 
-                        if use_buying_rates and random.random() > item.buy_rate_single:
-                            counts["buy rate too low"] += 1
-                            continue
+                        if use_buying_rates:
+                            rate_allowed = rate_allowed_this_cycle.get(
+                                purchase_key
+                            )
+
+                            if rate_allowed is None:
+                                rate_allowed = (
+                                    random.random()
+                                    <= item.buy_rate_single
+                                )
+                                rate_allowed_this_cycle[
+                                    purchase_key
+                                ] = rate_allowed
+
+                            if not rate_allowed:
+                                counts["buy rate too low"] += 1
+                                continue
 
                         if self._buy_row(row, item.price_single):
                             purchased_this_cycle.add(purchase_key)

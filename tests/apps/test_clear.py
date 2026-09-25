@@ -56,7 +56,29 @@ def test_main(
 
         # ensure database was cleared
         with populated_fake_db.scoped_session() as session:
+            # Clearing AHBot stock must preserve completed sale
+            # history. Only active unsold listings are removable.
             if clear_all:
-                assert session.query(AuctionHouse).count() == 0
+                expected = sum(
+                    1
+                    for t in transactions
+                    if (
+                        t.sale != 0
+                        or t.sell_date not in (None, 0)
+                    )
+                )
             else:
-                assert session.query(AuctionHouse).count() == sum(1 for t in transactions if t.seller != 0)
+                expected = sum(
+                    1
+                    for t in transactions
+                    if (
+                        t.sale != 0
+                        or t.sell_date not in (None, 0)
+                        or t.seller != 0
+                    )
+                )
+
+            assert (
+                session.query(AuctionHouse).count()
+                == expected
+            )
