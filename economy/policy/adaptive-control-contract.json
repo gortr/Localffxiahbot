@@ -1,0 +1,134 @@
+{
+  "activation_requirements": {
+    "atomic_publish": true,
+    "automatic_activation": false,
+    "fresh_validation": true,
+    "human_approval": true,
+    "post_activation_observation": true,
+    "post_publish_validation": true,
+    "runtime_backup": true,
+    "service_health_check": true
+  },
+  "analysis_allowed": 1,
+  "automatic_change_application_allowed": 0,
+  "automatic_service_restart_allowed": 0,
+  "contract_version": 1,
+  "control_domains": {
+    "buy_rate": {
+      "analysis_allowed": 1,
+      "live_apply_allowed": 0,
+      "proposal_allowed": 1
+    },
+    "buyer_bid": {
+      "analysis_allowed": 1,
+      "live_apply_allowed": 0,
+      "proposal_allowed": 1
+    },
+    "catalog_membership": {
+      "analysis_allowed": 1,
+      "live_apply_allowed": 0,
+      "proposal_allowed": 1
+    },
+    "sell_rate": {
+      "analysis_allowed": 1,
+      "live_apply_allowed": 0,
+      "proposal_allowed": 1
+    },
+    "seller_price": {
+      "analysis_allowed": 1,
+      "live_apply_allowed": 0,
+      "proposal_allowed": 1
+    },
+    "stock_target": {
+      "analysis_allowed": 1,
+      "live_apply_allowed": 0,
+      "proposal_allowed": 1
+    }
+  },
+  "control_mode": "PROPOSAL_ONLY",
+  "current_activation_state": "DESIGN_ONLY_LOCKED",
+  "evidence_dependencies": {
+    "craft_and_repeatability": {
+      "expansion_requires_recipe_path_reaudit": 1,
+      "required": true
+    },
+    "gil_flow": {
+      "block_count": 0,
+      "budget_state": "WATCH",
+      "current_evidence_state": "ACTUAL_FLOW_EVIDENCE_IMMATURE",
+      "currently_mature": 0,
+      "required": true,
+      "review_count": 0,
+      "source_phase": "3E",
+      "watch_count": 1
+    },
+    "market_response": {
+      "current_evidence_state": "EARLY_OBSERVATION",
+      "currently_mature": 0,
+      "required": true,
+      "source_phase": "3D"
+    },
+    "npc_vendor_policy": {
+      "required": true
+    }
+  },
+  "hard_invariants": {
+    "buyer_bid_may_meet_or_exceed_seller_ask": false,
+    "catalog_auto_promotion_allowed": false,
+    "market_history_auto_price_influence": false,
+    "market_history_auto_stock_influence": false,
+    "normal_maintenance_may_delete_completed_history": false,
+    "normal_maintenance_may_remove_only_active_unsold_bot_rows": true,
+    "npc_convenience_premium_policy_required": true,
+    "npc_vendor_relevance_required": true,
+    "observation_auto_activation_allowed": false,
+    "player_listings_count_toward_total_market_stock": true,
+    "preserve_completed_sale_history": true,
+    "repeatable_craft_arbitrage_allowed": false,
+    "seller_may_undercut_npc_vendor": false,
+    "source_integrity_failure_is_fail_closed": true
+  },
+  "human_approval_required": 1,
+  "live_database_mutation_allowed": 0,
+  "live_runtime_publish_allowed": 0,
+  "phase": "3F.1",
+  "phase_3f_authority": {
+    "auto_live_promotion": 0,
+    "catalog_change_authorized": 0,
+    "database_mutation_authorized": 0,
+    "price_change_authorized": 0,
+    "rate_change_authorized": 0,
+    "runtime_mutation_authorized": 0,
+    "stock_change_authorized": 0
+  },
+  "phase_3f_design_allowed": 1,
+  "proposal_generation_allowed": 1,
+  "proposal_requirements": {
+    "must_include_before_value": true,
+    "must_include_bound": true,
+    "must_include_evidence": true,
+    "must_include_human_approval_state": true,
+    "must_include_proposed_value": true,
+    "must_include_reason": true,
+    "must_include_rollback_plan": true,
+    "must_include_safety_checks": true
+  },
+  "proposal_states": [
+    "NO_CHANGE",
+    "INSUFFICIENT_EVIDENCE",
+    "HOLD",
+    "REVIEW_INCREASE",
+    "REVIEW_DECREASE",
+    "REVIEW_ADD",
+    "REVIEW_REMOVE",
+    "DEFER",
+    "BLOCK"
+  ],
+  "recommendation_generation_allowed": 1,
+  "simulation_allowed": 1,
+  "source_closeouts": {
+    "3D": "/home/rygol/ffxiahbot/economy/runtime-observations/player-market-response/closeout/phase-3d-closeout-summary.json",
+    "3E": "/home/rygol/ffxiahbot/economy/runtime-observations/gil-flow/closeout/phase-3e-closeout-summary.json"
+  },
+  "status": "PASS"
+}
